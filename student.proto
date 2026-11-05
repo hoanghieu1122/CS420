@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package student;
+
+// Thông tin đầy đủ của một sinh viên.
+message Student {
+  string id = 1;
+  string name = 2;
+  string email = 3;
+  string major = 4;
+  float gpa = 5;
+}
+
+message StudentIdRequest {
+  string id = 1;
+}
+
+message Empty {}
+
+message DeleteStudentResponse {
+  string message = 1;
+}
+
+service StudentService {
+  rpc CreateStudent(Student) returns (Student);
+  rpc GetStudent(StudentIdRequest) returns (Student);
+  rpc UpdateStudent(Student) returns (Student);
+  rpc DeleteStudent(StudentIdRequest) returns (DeleteStudentResponse);
+  rpc ListStudents(Empty) returns (stream Student);
+}
