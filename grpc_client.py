@@ -13,7 +13,7 @@ import student_pb2
 import student_pb2_grpc
 
 
-SERVER_ADDRESS = "192.168.1.217:50051"
+SERVER_ADDRESS = "127.0.0.1:50051"
 RPC_TIMEOUT_SECONDS = 8
 STREAM_TIMEOUT_SECONDS = 15
 CONNECTION_TIMEOUT_SECONDS = 3
@@ -50,13 +50,15 @@ class StudentGrpcClient:
         self._total_requests = 0
         self._last_latency_ms: float | None = None
         self._connected = False
-        self._channel: grpc.Channel
-        self._stub: student_pb2_grpc.StudentServiceStub
-        self._create_channel()
+        self._channel_generation = 0
+        self._channel, self._stub = self._create_channel(self.address)
 
-    def _create_channel(self) -> None:
-        self._channel = grpc.insecure_channel(self.address)
-        self._stub = student_pb2_grpc.StudentServiceStub(self._channel)
+    @staticmethod
+    def _create_channel(
+        address: str,
+    ) -> tuple[grpc.Channel, student_pb2_grpc.StudentServiceStub]:
+        channel = grpc.insecure_channel(address)
+        return channel, student_pb2_grpc.StudentServiceStub(channel)
 
     @staticmethod
     def _connection_failed(code: grpc.StatusCode) -> bool:
@@ -82,7 +84,9 @@ class StudentGrpcClient:
                 )
             )
 
-    def _execute(self, method: str, operation: Callable[[], T]) -> T:
+    def _execute(
+        self, method: str, operation: Callable[[], T], generation: int
+    ) -> T:
         started = time.perf_counter()
         try:
             result = operation()
@@ -90,10 +94,8 @@ class StudentGrpcClient:
             latency_ms = (time.perf_counter() - started) * 1000
             code = error.code()
             with self._lock:
-                if self._connection_failed(code):
-                    self._connected = False
-                else:
-                    self._connected = True
+                if generation == self._channel_generation:
+                    self._connected = not self._connection_failed(code)
             self._record(method, False, code.name, latency_ms)
             raise
         except BaseException:
@@ -103,77 +105,119 @@ class StudentGrpcClient:
 
         latency_ms = (time.perf_counter() - started) * 1000
         with self._lock:
-            self._connected = True
+            if generation == self._channel_generation:
+                self._connected = True
         self._record(method, True, "OK", latency_ms)
         return result
 
+    def _active_stub(
+        self,
+    ) -> tuple[student_pb2_grpc.StudentServiceStub, int]:
+        with self._lock:
+            return self._stub, self._channel_generation
+
     def create_student(self, student: student_pb2.Student) -> student_pb2.Student:
+        stub, generation = self._active_stub()
         return self._execute(
             "CreateStudent",
-            lambda: self._stub.CreateStudent(student, timeout=RPC_TIMEOUT_SECONDS),
+            lambda: stub.CreateStudent(student, timeout=RPC_TIMEOUT_SECONDS),
+            generation,
         )
 
     def get_student(self, student_id: str) -> student_pb2.Student:
+        stub, generation = self._active_stub()
         return self._execute(
             "GetStudent",
-            lambda: self._stub.GetStudent(
+            lambda: stub.GetStudent(
                 student_pb2.StudentIdRequest(id=student_id),
                 timeout=RPC_TIMEOUT_SECONDS,
             ),
+            generation,
         )
 
     def update_student(self, student: student_pb2.Student) -> student_pb2.Student:
+        stub, generation = self._active_stub()
         return self._execute(
             "UpdateStudent",
-            lambda: self._stub.UpdateStudent(student, timeout=RPC_TIMEOUT_SECONDS),
+            lambda: stub.UpdateStudent(student, timeout=RPC_TIMEOUT_SECONDS),
+            generation,
         )
 
     def delete_student(self, student_id: str) -> student_pb2.DeleteStudentResponse:
+        stub, generation = self._active_stub()
         return self._execute(
             "DeleteStudent",
-            lambda: self._stub.DeleteStudent(
+            lambda: stub.DeleteStudent(
                 student_pb2.StudentIdRequest(id=student_id),
                 timeout=RPC_TIMEOUT_SECONDS,
             ),
+            generation,
         )
 
     def list_students(self) -> list[student_pb2.Student]:
+        stub, generation = self._active_stub()
         return self._execute(
             "ListStudents",
             lambda: list(
-                self._stub.ListStudents(
+                stub.ListStudents(
                     student_pb2.Empty(), timeout=STREAM_TIMEOUT_SECONDS
                 )
             ),
+            generation,
         )
 
-    def check_connection(self) -> bool:
-        """Wait for the real channel to become ready without inventing an RPC."""
-
+    def _check_channel(self, channel: grpc.Channel, generation: int) -> bool:
         started = time.perf_counter()
+        connected = True
+        status = "READY"
         try:
-            grpc.channel_ready_future(self._channel).result(
+            grpc.channel_ready_future(channel).result(
                 timeout=CONNECTION_TIMEOUT_SECONDS
             )
         except (grpc.FutureTimeoutError, grpc.RpcError):
-            latency_ms = (time.perf_counter() - started) * 1000
-            with self._lock:
-                self._connected = False
-            self._record("ChannelReady", False, "UNAVAILABLE", latency_ms)
-            return False
+            connected = False
+            status = "UNAVAILABLE"
 
         latency_ms = (time.perf_counter() - started) * 1000
         with self._lock:
-            self._connected = True
-        self._record("ChannelReady", True, "READY", latency_ms)
-        return True
+            is_current = (
+                generation == self._channel_generation and channel is self._channel
+            )
+            if is_current:
+                self._connected = connected
+        if is_current:
+            self._record("ChannelReady", connected, status, latency_ms)
+        return connected and is_current
+
+    def check_connection(self) -> bool:
+        """Wait for the active channel to become ready without inventing an RPC."""
+
+        with self._lock:
+            channel = self._channel
+            generation = self._channel_generation
+        return self._check_channel(channel, generation)
+
+    def connect(self, address: str) -> bool:
+        normalized_address = address.strip()
+        if not normalized_address:
+            raise ValueError("Địa chỉ gRPC không được để trống.")
+
+        new_channel, new_stub = self._create_channel(normalized_address)
+        with self._lock:
+            old_channel = self._channel
+            self.address = normalized_address
+            self._channel = new_channel
+            self._stub = new_stub
+            self._connected = False
+            self._channel_generation += 1
+            generation = self._channel_generation
+        old_channel.close()
+        return self._check_channel(new_channel, generation)
 
     def reconnect(self) -> bool:
         with self._lock:
-            old_channel = self._channel
-            self._create_channel()
-        old_channel.close()
-        return self.check_connection()
+            address = self.address
+        return self.connect(address)
 
     def snapshot(self) -> ConnectionSnapshot:
         with self._lock:
@@ -188,4 +232,6 @@ class StudentGrpcClient:
     def close(self) -> None:
         with self._lock:
             self._connected = False
-            self._channel.close()
+            self._channel_generation += 1
+            channel = self._channel
+        channel.close()

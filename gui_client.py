@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import ipaddress
+import json
 import math
 import queue
 import re
 import threading
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Optional
 
@@ -37,6 +41,48 @@ COLORS = {
 
 FONT_FAMILY = "Segoe UI"
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+LOCAL_HOST = "127.0.0.1"
+DEFAULT_PORT = 50051
+CONNECTION_CONFIG_PATH = Path.home() / ".student_manager_connection.json"
+
+
+@dataclass(frozen=True)
+class ConnectionConfig:
+    mode: str = "local"
+    host: str = LOCAL_HOST
+    port: int = DEFAULT_PORT
+
+    @property
+    def address(self) -> str:
+        host = LOCAL_HOST if self.mode == "local" else self.host
+        return f"{host}:{self.port}"
+
+
+def load_connection_config() -> ConnectionConfig:
+    try:
+        raw_config = json.loads(CONNECTION_CONFIG_PATH.read_text(encoding="utf-8"))
+        mode = raw_config.get("mode")
+        host = str(raw_config.get("host", "")).strip()
+        port = int(raw_config.get("port", DEFAULT_PORT))
+        if mode not in {"local", "lan"} or not 1 <= port <= 65535:
+            raise ValueError
+        if mode == "local":
+            return ConnectionConfig()
+        ipaddress.IPv4Address(host)
+        return ConnectionConfig(mode="lan", host=host, port=port)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return ConnectionConfig()
+
+
+def save_connection_config(config: ConnectionConfig) -> None:
+    CONNECTION_CONFIG_PATH.write_text(
+        json.dumps(
+            {"mode": config.mode, "host": config.host, "port": config.port},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 class StudentDialog(ctk.CTkToplevel):
@@ -302,6 +348,297 @@ class StudentDialog(ctk.CTkToplevel):
             self.destroy()
 
 
+class ConnectionDialog(ctk.CTkToplevel):
+    """Hộp thoại chọn endpoint, tách biệt cấu hình nháp và kết nối thực tế."""
+
+    def __init__(
+        self,
+        parent: "StudentManagementApp",
+        config: ConnectionConfig,
+        snapshot: ConnectionSnapshot,
+    ) -> None:
+        super().__init__(parent)
+        self._parent = parent
+        self._busy = False
+        self._lan_host = config.host if config.mode == "lan" else ""
+        self._lan_port = config.port if config.mode == "lan" else DEFAULT_PORT
+
+        self.title("Cấu hình kết nối")
+        self.geometry("560x500")
+        self.minsize(520, 480)
+        self.resizable(False, False)
+        self.configure(fg_color=COLORS["background"])
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.grab_set()
+        self.grid_columnconfigure(0, weight=1)
+
+        self._build_widgets(config)
+        self.update_connection_status(snapshot)
+        self.bind("<Escape>", lambda _event: self._close())
+        self.after(20, self._center)
+
+    def _build_widgets(self, config: ConnectionConfig) -> None:
+        ctk.CTkLabel(
+            self,
+            text="Cấu hình kết nối",
+            anchor="w",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=24, weight="bold"),
+            text_color=COLORS["text"],
+        ).grid(row=0, column=0, padx=28, pady=(24, 2), sticky="ew")
+        ctk.CTkLabel(
+            self,
+            text="Chọn Local hoặc địa chỉ máy Server trong mạng Wi-Fi/LAN.",
+            anchor="w",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12),
+            text_color=COLORS["text_muted"],
+        ).grid(row=1, column=0, padx=28, pady=(0, 16), sticky="ew")
+
+        card = ctk.CTkFrame(
+            self,
+            fg_color=COLORS["surface"],
+            corner_radius=13,
+            border_width=1,
+            border_color=COLORS["border"],
+        )
+        card.grid(row=2, column=0, padx=28, sticky="ew")
+        card.grid_columnconfigure(0, weight=1)
+
+        self.mode_control = ctk.CTkSegmentedButton(
+            card,
+            values=["Local", "Wi-Fi/LAN"],
+            command=self._on_mode_changed,
+            height=40,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold"),
+        )
+        self.mode_control.grid(row=0, column=0, padx=18, pady=(18, 16), sticky="ew")
+        self.mode_control.set("Local" if config.mode == "local" else "Wi-Fi/LAN")
+
+        fields = ctk.CTkFrame(card, fg_color="transparent")
+        fields.grid(row=1, column=0, padx=18, sticky="ew")
+        fields.grid_columnconfigure(0, weight=3)
+        fields.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            fields,
+            text="IP máy Server",
+            anchor="w",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
+            text_color=COLORS["text"],
+        ).grid(row=0, column=0, padx=(0, 7), pady=(0, 5), sticky="ew")
+        ctk.CTkLabel(
+            fields,
+            text="Cổng",
+            anchor="w",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
+            text_color=COLORS["text"],
+        ).grid(row=0, column=1, padx=(7, 0), pady=(0, 5), sticky="ew")
+        self.host_entry = ctk.CTkEntry(
+            fields,
+            height=40,
+            placeholder_text="Ví dụ: 192.168.1.10",
+            border_color="#CBD5E1",
+            fg_color="#F8FAFC",
+        )
+        self.host_entry.grid(row=1, column=0, padx=(0, 7), sticky="ew")
+        self.port_entry = ctk.CTkEntry(
+            fields,
+            height=40,
+            placeholder_text=str(DEFAULT_PORT),
+            border_color="#CBD5E1",
+            fg_color="#F8FAFC",
+        )
+        self.port_entry.grid(row=1, column=1, padx=(7, 0), sticky="ew")
+        self.host_entry.bind("<KeyRelease>", self._draft_changed)
+        self.port_entry.bind("<KeyRelease>", self._draft_changed)
+
+        self.status_frame = ctk.CTkFrame(card, fg_color="#F8FAFC", corner_radius=9)
+        self.status_frame.grid(row=2, column=0, padx=18, pady=18, sticky="ew")
+        self.status_frame.grid_columnconfigure(0, weight=1)
+        self.status_label = ctk.CTkLabel(
+            self.status_frame,
+            text="●  Disconnected",
+            anchor="w",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold"),
+            text_color=COLORS["danger"],
+        )
+        self.status_label.grid(row=0, column=0, padx=14, pady=(11, 1), sticky="ew")
+        self.actual_address_label = ctk.CTkLabel(
+            self.status_frame,
+            text="",
+            anchor="w",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11),
+            text_color=COLORS["text_muted"],
+        )
+        self.actual_address_label.grid(
+            row=1, column=0, padx=14, pady=(0, 11), sticky="ew"
+        )
+
+        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons.grid(row=3, column=0, padx=28, pady=18, sticky="ew")
+        buttons.grid_columnconfigure((0, 1), weight=1)
+        self.cancel_button = ctk.CTkButton(
+            buttons,
+            text="Đóng",
+            height=42,
+            fg_color=COLORS["surface_muted"],
+            hover_color="#CBD5E1",
+            text_color=COLORS["text"],
+            command=self._close,
+        )
+        self.cancel_button.grid(row=0, column=0, padx=(0, 7), sticky="ew")
+        self.connect_button = ctk.CTkButton(
+            buttons,
+            text="Kết nối",
+            height=42,
+            fg_color=COLORS["primary"],
+            hover_color=COLORS["primary_hover"],
+            font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold"),
+            command=self._submit,
+        )
+        self.connect_button.grid(row=0, column=1, padx=(7, 0), sticky="ew")
+        self._apply_mode_fields()
+
+    def _center(self) -> None:
+        if not self.winfo_exists():
+            return
+        self.update_idletasks()
+        width, height = self.winfo_width(), self.winfo_height()
+        x = self._parent.winfo_rootx() + (self._parent.winfo_width() - width) // 2
+        y = self._parent.winfo_rooty() + (self._parent.winfo_height() - height) // 2
+        self.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
+
+    def _on_mode_changed(self, selected_mode: str) -> None:
+        if selected_mode == "Local":
+            current_host = self.host_entry.get().strip()
+            current_port = self.port_entry.get().strip()
+            if current_host and current_host != LOCAL_HOST:
+                self._lan_host = current_host
+            if current_port.isdigit():
+                self._lan_port = int(current_port)
+        self._apply_mode_fields()
+        self.update_connection_status(self._parent.grpc_client.snapshot())
+
+    def _draft_changed(self, _event: Any = None) -> None:
+        self.update_connection_status(self._parent.grpc_client.snapshot())
+
+    def _apply_mode_fields(self) -> None:
+        local_mode = self.mode_control.get() == "Local"
+        self.host_entry.configure(state="normal")
+        self.port_entry.configure(state="normal")
+        self.host_entry.delete(0, "end")
+        self.port_entry.delete(0, "end")
+        if local_mode:
+            self.host_entry.insert(0, LOCAL_HOST)
+            self.port_entry.insert(0, str(DEFAULT_PORT))
+            self.host_entry.configure(state="disabled")
+            self.port_entry.configure(state="disabled")
+        else:
+            if self._lan_host:
+                self.host_entry.insert(0, self._lan_host)
+            self.port_entry.insert(0, str(self._lan_port))
+
+    def _selected_config(self, show_error: bool = True) -> Optional[ConnectionConfig]:
+        if self.mode_control.get() == "Local":
+            return ConnectionConfig()
+
+        host = self.host_entry.get().strip()
+        port_text = self.port_entry.get().strip() or str(DEFAULT_PORT)
+        try:
+            ipaddress.IPv4Address(host)
+        except ipaddress.AddressValueError:
+            if show_error:
+                messagebox.showerror(
+                    "Địa chỉ không hợp lệ",
+                    "Vui lòng nhập địa chỉ IPv4 hợp lệ của máy Server.",
+                    parent=self,
+                )
+            return None
+        try:
+            port = int(port_text)
+        except ValueError:
+            port = 0
+        if not 1 <= port <= 65535:
+            if show_error:
+                messagebox.showerror(
+                    "Cổng không hợp lệ",
+                    "Cổng phải là số nguyên từ 1 đến 65535.",
+                    parent=self,
+                )
+            return None
+        self._lan_host = host
+        self._lan_port = port
+        return ConnectionConfig(mode="lan", host=host, port=port)
+
+    def _submit(self) -> None:
+        if self._busy:
+            return
+        config = self._selected_config()
+        if config is None:
+            return
+        self.set_busy(True, config.address)
+        self._parent.connect_from_dialog(config, self)
+
+    def set_busy(self, busy: bool, address: Optional[str] = None) -> None:
+        if not self.winfo_exists():
+            return
+        self._busy = busy
+        state = "disabled" if busy else "normal"
+        self.mode_control.configure(state=state)
+        self.host_entry.configure(state=state)
+        self.port_entry.configure(state=state)
+        self.connect_button.configure(
+            state=state, text="Đang kết nối..." if busy else "Kết nối"
+        )
+        self.cancel_button.configure(state="normal")
+        if busy:
+            self.status_label.configure(
+                text="●  Đang kết nối...", text_color=COLORS["warning"]
+            )
+            self.actual_address_label.configure(text=f"Đang thử: {address}")
+        else:
+            self._apply_mode_fields()
+            self.update_connection_status(self._parent.grpc_client.snapshot())
+
+    def update_connection_status(self, snapshot: ConnectionSnapshot) -> None:
+        if not self.winfo_exists() or self._busy:
+            return
+        config = self._selected_config(show_error=False)
+        selected_address = config.address if config is not None else None
+        if snapshot.connected and selected_address == snapshot.address:
+            status_text = "●  Connected"
+            status_color = COLORS["success"]
+        elif selected_address != snapshot.address:
+            status_text = "●  Chưa kết nối lựa chọn này"
+            status_color = COLORS["warning"]
+        else:
+            status_text = "●  Disconnected"
+            status_color = COLORS["danger"]
+        self.status_label.configure(text=status_text, text_color=status_color)
+        self.actual_address_label.configure(
+            text=f"Địa chỉ thực tế: {snapshot.address}"
+        )
+
+    def show_connection_error(self, address: str) -> None:
+        if not self.winfo_exists():
+            return
+        messagebox.showerror(
+            "Không thể kết nối",
+            f"Không thể kết nối đến gRPC Server tại {address}.\n"
+            "Vui lòng kiểm tra IP, cổng, Server và tường lửa.",
+            parent=self,
+        )
+
+    def _close(self) -> None:
+        if not self.winfo_exists():
+            return
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self._parent.connection_dialog_closed(self)
+        self.destroy()
+
+
 class StudentManagementApp(ctk.CTk):
     """Dashboard bốn trang kết nối Student Service qua gateway thread-safe."""
 
@@ -327,9 +664,13 @@ class StudentManagementApp(ctk.CTk):
         self._current_page = "dashboard"
         self._refresh_in_progress = False
         self._search_in_progress = False
+        self._connection_generation = 0
+        self._connection_lock = threading.Lock()
+        self.connection_dialog: Optional[ConnectionDialog] = None
         self._queue_after_id: Optional[str] = None
         self._telemetry_after_id: Optional[str] = None
-        self.grpc_client = StudentGrpcClient()
+        self.connection_config = load_connection_config()
+        self.grpc_client = StudentGrpcClient(self.connection_config.address)
 
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
@@ -341,7 +682,7 @@ class StudentManagementApp(ctk.CTk):
         self._show_page("dashboard")
         self._queue_after_id = self.after(50, self._drain_ui_queue)
         self._telemetry_after_id = self.after(250, self._telemetry_tick)
-        self.after(150, self.refresh_students)
+        self.after(150, self._connect_saved_endpoint)
 
     def _build_sidebar(self) -> None:
         sidebar = ctk.CTkFrame(self, width=240, corner_radius=0, fg_color=COLORS["sidebar"])
@@ -406,13 +747,14 @@ class StudentManagementApp(ctk.CTk):
             text_color="#FCA5A5",
         )
         self.status_label.grid(row=1, column=0, padx=14, sticky="ew")
-        ctk.CTkLabel(
+        self.sidebar_address_label = ctk.CTkLabel(
             footer,
             text=self.grpc_client.address,
             anchor="w",
             font=ctk.CTkFont(family=FONT_FAMILY, size=11),
             text_color="#BFDBFE",
-        ).grid(row=2, column=0, padx=14, pady=(1, 9), sticky="ew")
+        )
+        self.sidebar_address_label.grid(row=2, column=0, padx=14, pady=(1, 9), sticky="ew")
         self.reconnect_button = ctk.CTkButton(
             footer,
             text="↻  Reconnect",
@@ -653,7 +995,10 @@ class StudentManagementApp(ctk.CTk):
             node = ctk.CTkFrame(flow_card, fg_color="#EFF6FF", corner_radius=9, border_width=1, border_color="#BFDBFE")
             node.grid(row=0, column=column, padx=(12 if index == 0 else 4, 12 if index == 3 else 4), pady=10, sticky="ew")
             ctk.CTkLabel(node, text=title, font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"), text_color="#1E3A8A").pack(padx=8, pady=(7, 0))
-            ctk.CTkLabel(node, text=subtitle, font=ctk.CTkFont(family=FONT_FAMILY, size=9), text_color=COLORS["text_muted"]).pack(padx=8, pady=(0, 7))
+            subtitle_label = ctk.CTkLabel(node, text=subtitle, font=ctk.CTkFont(family=FONT_FAMILY, size=9), text_color=COLORS["text_muted"])
+            subtitle_label.pack(padx=8, pady=(0, 7))
+            if title == "gRPC Channel":
+                self.monitor_address_label = subtitle_label
             if index < len(nodes) - 1:
                 ctk.CTkLabel(flow_card, text="→", font=ctk.CTkFont(size=20, weight="bold"), text_color=COLORS["primary"]).grid(row=0, column=column + 1)
         return page
@@ -977,26 +1322,114 @@ class StudentManagementApp(ctk.CTk):
 
         self._run_rpc(lambda: self.grpc_client.delete_student(student.id), success, failure)
 
-    def reconnect(self) -> None:
+    def _connect_saved_endpoint(self) -> None:
+        self._start_connection(
+            self.connection_config, show_error=False, save_config=False
+        )
+
+    def connect_from_dialog(
+        self, config: ConnectionConfig, dialog: ConnectionDialog
+    ) -> None:
+        self._start_connection(config, show_error=True, dialog=dialog)
+
+    def _start_connection(
+        self,
+        config: ConnectionConfig,
+        show_error: bool = True,
+        save_config: bool = True,
+        dialog: Optional[ConnectionDialog] = None,
+    ) -> None:
+        if save_config:
+            self.connection_config = config
+            try:
+                save_connection_config(config)
+            except OSError as error:
+                if show_error:
+                    messagebox.showwarning(
+                        "Không thể lưu cấu hình",
+                        f"Kết nối vẫn được thử nhưng không thể lưu cấu hình: {error}",
+                        parent=dialog if dialog is not None and dialog.winfo_exists() else self,
+                    )
+
+        with self._connection_lock:
+            self._connection_generation += 1
+            generation = self._connection_generation
         self.reconnect_button.configure(state="disabled", text="Đang kết nối...")
 
+        def current_dialog() -> Optional[ConnectionDialog]:
+            if dialog is not None and dialog.winfo_exists():
+                return dialog
+            return None
+
         def success(connected: bool) -> None:
+            with self._connection_lock:
+                if generation != self._connection_generation:
+                    return
             self.reconnect_button.configure(state="normal", text="↻  Reconnect")
+            active_dialog = current_dialog()
+            if active_dialog is not None:
+                active_dialog.set_busy(False)
             self._refresh_telemetry_views()
             if connected:
                 self.refresh_students()
-            else:
-                messagebox.showerror(
-                    "Không thể kết nối",
-                    f"Không thể kết nối đến gRPC Server tại {self.grpc_client.address}.",
-                    parent=self,
-                )
+            elif show_error:
+                if active_dialog is not None:
+                    active_dialog.show_connection_error(config.address)
+                else:
+                    messagebox.showerror(
+                        "Không thể kết nối",
+                        f"Không thể kết nối đến gRPC Server tại {config.address}.\n"
+                        "Vui lòng kiểm tra IP, cổng, Server và tường lửa.",
+                        parent=self,
+                    )
 
         def failure(error: BaseException) -> None:
+            with self._connection_lock:
+                if generation != self._connection_generation:
+                    return
             self.reconnect_button.configure(state="normal", text="↻  Reconnect")
-            self._handle_rpc_error(error)
+            active_dialog = current_dialog()
+            if active_dialog is not None:
+                active_dialog.set_busy(False)
+            self._refresh_telemetry_views()
+            if show_error:
+                self._handle_rpc_error(error, parent=active_dialog or self)
+            else:
+                self._refresh_telemetry_views()
 
-        self._run_rpc(self.grpc_client.reconnect, success, failure)
+        self._run_rpc(
+            lambda: self.grpc_client.connect(config.address), success, failure
+        )
+
+    def reconnect(self) -> None:
+        if self.connection_dialog is not None and self.connection_dialog.winfo_exists():
+            self.connection_dialog.deiconify()
+            self.connection_dialog.lift()
+            self.connection_dialog.focus_force()
+            return
+        snapshot = self.grpc_client.snapshot()
+        dialog_config = self.connection_config
+        try:
+            host, port_text = snapshot.address.rsplit(":", 1)
+            if snapshot.address == f"{LOCAL_HOST}:{DEFAULT_PORT}":
+                dialog_config = ConnectionConfig()
+            elif snapshot.address == self.connection_config.address:
+                dialog_config = self.connection_config
+            else:
+                dialog_config = ConnectionConfig(
+                    mode="lan", host=host, port=int(port_text)
+                )
+        except (TypeError, ValueError):
+            pass
+        self.connection_dialog = ConnectionDialog(
+            self,
+            dialog_config,
+            snapshot,
+        )
+
+    def connection_dialog_closed(self, dialog: ConnectionDialog) -> None:
+        if self.connection_dialog is dialog:
+            self.connection_dialog = None
 
     def _sync_data_views(self) -> None:
         students = list(self._students.values())
@@ -1054,6 +1487,10 @@ class StudentManagementApp(ctk.CTk):
             return
         snapshot = self.grpc_client.snapshot()
         self._set_connection_status(snapshot.connected)
+        self.sidebar_address_label.configure(text=snapshot.address)
+        self.monitor_address_label.configure(text=snapshot.address)
+        if self.connection_dialog is not None and self.connection_dialog.winfo_exists():
+            self.connection_dialog.update_connection_status(snapshot)
         successes = sum(record.success for record in snapshot.history)
         failures = len(snapshot.history) - successes
         self.monitor_values["requests"].configure(text=str(snapshot.total_requests))
@@ -1129,6 +1566,13 @@ class StudentManagementApp(ctk.CTk):
         if self._closing:
             return
         self._closing = True
+        if self.connection_dialog is not None and self.connection_dialog.winfo_exists():
+            try:
+                self.connection_dialog.grab_release()
+            except Exception:
+                pass
+            self.connection_dialog.destroy()
+            self.connection_dialog = None
         for after_id in (self._queue_after_id, self._telemetry_after_id):
             if after_id is not None:
                 try:
